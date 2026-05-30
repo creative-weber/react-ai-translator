@@ -17,6 +17,13 @@ function App() {
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
+  // Warm up the model whenever the language pair changes
+  useEffect(() => {
+    if (workerRef.current && fromLang !== toLang) {
+      workerRef.current.postMessage({ type: 'warmup', from: fromLang, to: toLang });
+    }
+  }, [fromLang, toLang]);
+
   // Boot the translation Web Worker once
   useEffect(() => {
     console.log('[App] Booting translation worker…');
@@ -65,10 +72,16 @@ function App() {
       console.error('[App] Worker message deserialization error:', err);
     });
 
+    // Pre-load the default language pair immediately after boot
+    if (fromLang !== toLang) {
+      workerRef.current.postMessage({ type: 'warmup', from: fromLang, to: toLang });
+    }
+
     return () => {
       console.log('[App] Terminating worker.');
       workerRef.current?.terminate();
     };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Auto-scroll to latest message

@@ -1,11 +1,18 @@
-type WorkerRequest = {
-  id: string;
-  text: string;
-  from: string;
-  to: string;
-  /** Terms that must not be translated (e.g. company names, proper nouns). */
-  protectedTerms?: string[];
-};
+type WorkerRequest =
+  | {
+      type?: 'translate';
+      id: string;
+      text: string;
+      from: string;
+      to: string;
+      /** Terms that must not be translated (e.g. company names, proper nouns). */
+      protectedTerms?: string[];
+    }
+  | {
+      type: 'warmup';
+      from: string;
+      to: string;
+    };
 
 type WorkerResponse =
   | { id: string; status: 'loading'; model: string }
@@ -59,6 +66,8 @@ type TransformersModule = {
 
 // Cache loaded pipelines so repeat translations with the same pair are instant
 const pipelineCache = new Map<string, TranslateFn>();
+// In-flight promise cache: prevents duplicate pipeline() calls for the same model
+const pipelineLoadingCache = new Map<string, Promise<TranslateFn>>();
 let transformersModulePromise: Promise<TransformersModule> | null = null;
 const getTransformersModule = async (): Promise<TransformersModule> => {
   if (!transformersModulePromise) {
@@ -76,8 +85,65 @@ const getTransformersModule = async (): Promise<TransformersModule> => {
   return mod;
 };
 
+/**
+ * Load a pipeline exactly once per model name. Concurrent callers share the
+ * same in-flight promise so only one download ever starts for a given model.
+ */
+function loadPipeline(
+  modelName: string,
+  progressCallback?: (info: { status: string; loaded?: number; total?: number }) => void,
+): Promise<TranslateFn> {
+  if (pipelineCache.has(modelName)) {
+    console.log(`[Worker] loadPipeline: cache hit for "${modelName}", returning immediately.`);
+    return Promise.resolve(pipelineCache.get(modelName)!);
+  }
+  if (!pipelineLoadingCache.has(modelName)) {
+    console.log(`[Worker] loadPipeline: no in-flight load for "${modelName}", starting new download.`);
+    const promise = getTransformersModule().then(({ pipeline }) =>
+      pipeline('translation', modelName, {
+        progress_callback: progressCallback,
+      })
+    ).then(translator => {
+      const fn = translator as unknown as TranslateFn;
+      pipelineCache.set(modelName, fn);
+      pipelineLoadingCache.delete(modelName);
+      console.log(`[Worker] loadPipeline: download complete, "${modelName}" moved to pipelineCache.`);
+      return fn;
+    }).catch(err => {
+      pipelineLoadingCache.delete(modelName);
+      console.error(`[Worker] loadPipeline: download failed for "${modelName}", removing from pipelineLoadingCache.`, err);
+      throw err;
+    });
+    pipelineLoadingCache.set(modelName, promise);
+  } else {
+    console.log(`[Worker] loadPipeline: in-flight load already exists for "${modelName}", attaching to existing promise.`);
+  }
+  return pipelineLoadingCache.get(modelName)!;
+}
+
 self.addEventListener('message', async (event: MessageEvent<WorkerRequest>) => {
-  const { id, text, from, to, protectedTerms = [] } = event.data;
+  const data = event.data;
+
+  // Warm-up: pre-load the pipeline for a language pair without translating
+  if (data.type === 'warmup') {
+    const { from, to } = data;
+    if (from === to) return;
+    const modelName = `Xenova/opus-mt-${from}-${to}`;
+    if (pipelineCache.has(modelName) || pipelineLoadingCache.has(modelName)) {
+      console.log(`[Worker] Warm-up skipped for "${modelName}" — already cached or loading.`);
+      return;
+    }
+    console.log(`[Worker] Warming up model: ${modelName}`);
+    try {
+      await loadPipeline(modelName);
+      console.log(`[Worker] Warm-up complete: ${modelName}`);
+    } catch (err) {
+      console.warn(`[Worker] Warm-up failed for ${modelName}:`, err);
+    }
+    return;
+  }
+
+  const { id, text, from, to, protectedTerms = [] } = data;
   console.log(`[Worker] ← message received [${id}]:`, { text, from, to, protectedTerms });
 
   if (from === to) {
@@ -93,27 +159,24 @@ self.addEventListener('message', async (event: MessageEvent<WorkerRequest>) => {
 
   try {
     console.log('[Worker] Loading Transformers.js module…');
-    const { pipeline } = await getTransformersModule();
+    await getTransformersModule();
     console.log('[Worker] Transformers.js module ready.');
 
     self.postMessage({ id, status: 'loading', model: modelName } satisfies WorkerResponse);
 
     if (!pipelineCache.has(modelName)) {
       console.log(`[Worker] Pipeline not cached — downloading/loading model: ${modelName}`);
-      const translator = await pipeline('translation', modelName, {
-        progress_callback: (info: { status: string; loaded?: number; total?: number }) => {
-          console.log(`[Worker] Progress callback:`, info);
-          if (info.status === 'progress' && info.loaded !== undefined && info.total !== undefined) {
-            self.postMessage({
-              id,
-              status: 'progress',
-              loaded: info.loaded,
-              total: info.total,
-            } satisfies WorkerResponse);
-          }
-        },
+      await loadPipeline(modelName, (info: { status: string; loaded?: number; total?: number }) => {
+        console.log(`[Worker] Progress callback:`, info);
+        if (info.status === 'progress' && info.loaded !== undefined && info.total !== undefined) {
+          self.postMessage({
+            id,
+            status: 'progress',
+            loaded: info.loaded,
+            total: info.total,
+          } satisfies WorkerResponse);
+        }
       });
-      pipelineCache.set(modelName, translator as unknown as TranslateFn);
       console.log(`[Worker] Pipeline cached for: ${modelName}`);
     } else {
       console.log(`[Worker] Pipeline cache hit for: ${modelName}`);
