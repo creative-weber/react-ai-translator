@@ -1,0 +1,26 @@
+{
+  "extends": "./tsconfig.app.json",
+  "compilerOptions": {
+    "allowImportingTsExtensions": false,
+    "noEmit": false,
+    "declaration": true,
+    "declarationDir": "dist/types",
+    "emitDeclarationOnly": true,
+    "outDir": "dist"
+  },
+  "include": ["src"],
+  "exclude": [
+    "src/main.tsx",
+    "src/App.tsx",
+    "src/Root.tsx",
+    "src/Phase2Demo.tsx",
+    "src/Phase3Demo.tsx",
+    "src/Phase4Demo.tsx",
+    "src/components/LanguageSelector.tsx",
+    "src/components/MessageBubble.tsx",
+    "src/hooks/useSpeaker.ts",
+    "src/hooks/useVoiceInput.ts",
+    "**/*.test.*",
+    "**/*.spec.*"
+  ]
+}
